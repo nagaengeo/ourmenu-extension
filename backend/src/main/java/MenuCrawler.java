@@ -1,73 +1,132 @@
+import com.google.api.core.ApiFuture;
+import com.google.cloud.firestore.Firestore;
+import com.google.cloud.firestore.WriteBatch;
+import com.google.cloud.firestore.WriteResult;
+import com.google.firebase.FirebaseApp;
+import com.google.firebase.FirebaseOptions;
+import com.google.firebase.cloud.FirestoreClient;
+import com.google.auth.oauth2.GoogleCredentials;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
 import org.jsoup.select.Elements;
 
-import java.io.IOException;
+import java.io.FileInputStream;
+import java.time.DayOfWeek;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 public class MenuCrawler {
     public static void main(String[] args) {
-        // 1. 크롤링 타겟 URL (숭실대 생협 식단 페이지)
-        String url = "https://soongguri.com/main.php?mkey=2&w=3&l=1";
-
         try {
-            // 2. Jsoup을 이용해 HTML 문서 가져오기
-            // userAgent는 봇 차단을 방지하기 위해 일반 브라우저처럼 보이게 설정합니다.
-            Document doc = Jsoup.connect(url)
-                    .userAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-                    .get();
+            FileInputStream serviceAccount = new FileInputStream("src/main/resources/serviceAccountKey.json");
+            FirebaseOptions options = FirebaseOptions.builder()
+                    .setCredentials(GoogleCredentials.fromStream(serviceAccount))
+                    .build();
+            if (FirebaseApp.getApps().isEmpty()) FirebaseApp.initializeApp(options);
+            Firestore db = FirestoreClient.getFirestore();
 
-            // 3. 식당 이름 추출 (td 태그 중 클래스가 rest_nm인 요소들)
-            // 학생식당, 숭실도담, FACULTY LOUNGE, 스넥코너 등이 잡힙니다.
-            Elements restaurantSections = doc.select("td.rest_nm");
+            String url = "https://soongguri.com/main.php?mkey=2&w=3&l=2";
+            Document doc = Jsoup.connect(url).userAgent("Mozilla/5.0").get();
 
-            for (Element restNm : restaurantSections) {
-                String restaurantName = restNm.text();
-                System.out.println("\n📍 식당: " + restaurantName);
-                System.out.println("----------------------------------------------");
+            LocalDate monday = LocalDate.now().with(DayOfWeek.MONDAY);
+            DateTimeFormatter fmt = DateTimeFormatter.ofPattern("yyyyMMdd");
+            WriteBatch batch = db.batch();
+            int count = 0;
 
-                // 4. 식당명 바로 아래 행(tr)에 메뉴 정보가 들어있습니다.
-                // HTML 구조: <tr><td>식당명</td></tr> <tr><td>메뉴정보</td></tr>
-                Element menuRow = restNm.parent().nextElementSibling();
+            Elements rows = doc.select("tr");
+            String currentRestaurant = "Unknown";
 
-                if (menuRow == null) continue;
+            for (Element row : rows) {
+                String text = row.text().trim();
 
-                // 5. 메뉴가 없는 경우 ("오늘 등록된 메뉴가 없습니다.") 체크
-                Elements noMenu = menuRow.select("td.rest_nomn");
-                if (!noMenu.isEmpty()) {
-                    System.out.println("정보: " + noMenu.text());
+                // 1. 식당 이름 감지
+                if (row.select("div.rest-ico").first() != null ||
+                        text.contains("학생식당") || text.contains("숭실도담") ||
+                        text.contains("FACULTY LOUNGE") || text.contains("스넥코너") || text.contains("푸드코트")) {
+
+                    currentRestaurant = text.replace("!", "").replace("★", "").trim();
                     continue;
                 }
 
-                // 6. 메뉴 이미지 및 텍스트 추출
-                // 이미지 태그 중 경로가 /menu/menu_file/로 시작하는 요소를 찾습니다.
-                Elements menuImages = menuRow.select("img[src^=/menu/menu_file/]");
+                Elements cells = row.children();
+                if (cells.size() < 13 || !cells.get(0).hasClass("menu-list-corn")) continue;
+                String corner = cells.get(0).text().trim();
 
-                if (menuImages.isEmpty()) {
-                    // 이미지가 없는 경우 텍스트만이라도 가져옵니다.
-                    String plainTextMenu = menuRow.text();
-                    System.out.println("메뉴(텍스트): " + plainTextMenu);
-                } else {
-                    for (Element img : menuImages) {
-                        // 이미지의 절대 경로 생성
-                        String imgUrl = "https://soongguri.com" + img.attr("src");
+                for (int i = 2; i <= 12; i += 2) {
+                    Element cell = cells.get(i);
 
-                        // 이미지 태그의 부모의 이전 형제 노드에 메뉴 이름과 가격이 있는 경우가 많습니다.
-                        // 파싱이 까다로운 경우 텍스트 전체에서 필요한 부분만 추출합니다.
-                        Element infoArea = img.parent().previousElementSibling();
-                        String menuInfo = (infoArea != null) ? infoArea.text() : "메뉴명 확인 필요";
+                    // 2. 줄바꿈 태그를 구분자로 치환 후 리스트로 분리
+                    String rawHtml = cell.html()
+                            .replaceAll("(?i)<br[^>]*>", "@@")
+                            .replaceAll("(?i)</?(div|p|tr|table)[^>]*>", "@@");
 
-                        System.out.println("🍴 메뉴: " + menuInfo);
-                        System.out.println("📸 이미지: " + imgUrl);
+                    List<String> lines = Arrays.stream(Jsoup.parse(rawHtml).text().split("@@"))
+                            .map(line -> line.replace("★", "").trim()) // 별표 제거 및 공백 정리
+                            .filter(line -> !line.isEmpty())
+                            .collect(Collectors.toList());
+
+                    if (lines.isEmpty() || String.join("", lines).contains("등록된 메뉴가 없습니다")) continue;
+
+                    // 3. 리스트를 콤마(,)로 연결하여 상세 정보 생성
+                    String fullText = String.join(", ", lines);
+
+                    // 4. 가격 및 메뉴명 분리
+                    String price = "-";
+                    String menuName = lines.get(0); // 기본값은 첫 줄
+                    Matcher priceMatcher = Pattern.compile("-\\s*([0-9]+\\.[0-9]+)").matcher(fullText);
+                    if (priceMatcher.find()) {
+                        price = priceMatcher.group(1);
+                        menuName = fullText.substring(0, priceMatcher.start()).replace(", ", " ").trim();
                     }
+                    menuName = menuName.replaceAll("\\[.*?\\]", "").trim(); // [추천메뉴] 등 제거
+
+                    // 5. 알러지 및 원산지 정보 정제 (콤마 처리 포함)
+                    String allergy = cleanInfo(extractInfo(fullText, "*알러지유발식품:", "*원산지:"));
+                    String origin = cleanInfo(extractInfo(fullText, "*원산지:", null));
+
+                    String targetDate = monday.plusDays((i / 2) - 1).format(fmt);
+
+                    Map<String, Object> data = new HashMap<>();
+                    data.put("date", targetDate);
+                    data.put("restaurant", currentRestaurant);
+                    data.put("corner", corner);
+                    data.put("menu_name", menuName);
+                    data.put("price", price);
+                    data.put("details", fullText); // 반찬들이 콤마로 연결됨
+                    data.put("allergy", allergy);
+                    data.put("origin", origin);
+                    data.put("updated_at", com.google.cloud.Timestamp.now());
+
+                    String docId = targetDate + "_" + currentRestaurant.replaceAll(" ", "") + "_" + corner.replaceAll(" ", "");
+                    batch.set(db.collection("weekly_menus").document(docId), data);
+                    count++;
                 }
-                System.out.println("----------------------------------------------");
             }
 
-        } catch (IOException e) {
-            // 네트워크 연결 실패 시 로그 출력
-            System.err.println("크롤링 중 오류 발생: " + e.getMessage());
-            e.printStackTrace();
-        }
+            if (count > 0) {
+                batch.commit().get();
+                System.out.println("총 " + count + "건 저장 성공");
+            }
+        } catch (Exception e) { e.printStackTrace(); }
+    }
+
+    private static String extractInfo(String text, String startKey, String endKey) {
+        if (!text.contains(startKey)) return "-";
+        try {
+            int start = text.indexOf(startKey) + startKey.length();
+            int end = (endKey != null && text.contains(endKey)) ? text.indexOf(endKey) : text.length();
+            return text.substring(start, end).trim();
+        } catch (Exception e) { return "-"; }
+    }
+
+    // 정보 내 불필요한 콤마나 공백 추가 정제
+    private static String cleanInfo(String text) {
+        if (text.equals("-")) return text;
+        return text.startsWith(", ") ? text.substring(2) : text;
     }
 }

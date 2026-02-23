@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd /c/Users/natal/ourMenu-extension/backend && find src/ -type f -name \"*.java\" | xargs ls -la 2>/dev/null)",
+      "Bash(echo curl failed:*)"
+    ]
+  }
+}
